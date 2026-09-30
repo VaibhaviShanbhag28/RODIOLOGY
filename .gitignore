@@ -4,3 +4,4 @@ __pycache__/
 checkpoints/*.pt
 data/raw/
 .DS_Store
+imp.txt
