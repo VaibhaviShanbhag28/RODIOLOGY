@@ -1,0 +1,105 @@
+Radiology Report Generation — Project Summary (Carry-Forward Doc)
+Project Goal
+
+Build a research pipeline that generates a radiology report from an input image, using the ROCOv2 dataset, fusing visual features with predicted UMLS/CUI concept information. Progression: literature review → architecture design → dataset understanding → small CPU prototype (10/2/2 images) → debugging → full GPU training → evaluation (BLEU-1–4).
+
+Working Rules (from original brief — still apply)
+No hallucinated paper facts — mark [DIRECTLY FROM PAPER] / [REASONABLE INFERENCE] / [OUR PROPOSED DESIGN].
+Ground-truth report/CUIs must NEVER be visible to the model at inference — only at training time as supervision.
+Build incrementally — no huge code dumps, no jumping straight to full GPU training.
+First implementation = CPU prototype with train=10 / val=2 / test=2, seed=42, reproducible split files.
+This is a research prototype — never claim clinical reliability or deployability.
+Status on Source Papers
+The user's "Research_Papers_and_Documentation" folder upload failed twice (came through as 0-byte files) — actual PDF content was never received.
+User gave a screenshot listing 10 paper titles ("Partner's Set — CNN/Hybrid Based Papers", numbered #2–#20).
+Claude web-searched these titles and verified content for 6 of them; 4 remain [TITLE ONLY] — unverified, not confirmed via source:
+#10 Multimodal Foundation Models Exploit Text to Make Medical Image Predictions
+#16 Efficient Optimization of Multimodal Language Models...ROCO
+#19 Enhancing Radiology Report Generation via Multi-Phased Supervision
+#20 Medical Image Captioning via Generative Pretrained Transformers
+→ If the guide has these PDFs, upload individually (not as a folder) to close this gap.
+User explicitly said: proceed without the folder, using what's been web-verified.
+Key Verified Facts
+About ROCOv2 (critical — corrects the original whiteboard)
+ROCOv2 images come from the PMC Open Access Subset, ~79,789 images.
+UMLS CUIs are already included per image, extracted via MedCAT (trained on MIMIC-III) — no live UMLS API call or license needed for training data.
+Implication: the "Bio/UMLS → CUI" lookup step on the whiteboard is unnecessary at training time. The real design problem is predicting CUIs from the image at inference (since ground-truth CUIs won't be available then).
+About the papers reviewed
+Paper	Dataset	Relevance
+Diagnostic Captioning (Cooperative Task Interactions)	not confirmed	Two-branch (ITM + RG) mutual reinforcement idea; no architecture detail found
+VG-CALF	SLAKE, VQA-RAD	Medical VQA, not report generation — fusion idea only, not a baseline
+Regional Attention-Enhanced Swin Transformer	ROCOv2	Most directly relevant — confirms 2022 ImageCLEFmedical winner used a CNN ensemble (5×DenseNet-201 + ResNet-152) for concept detection, feeding a transformer decoder
+ChestX-Transcribe	Indiana Univ CXR (not ROCOv2)	Swin + DistilGPT pattern, different dataset
+PriorRG	MIMIC-CXR/ABN	Needs longitudinal/multi-visit data — not usable as-is on ROCOv2
+SERPENT-VLM	IU X-ray + ROCO	Self-refining loss to reduce hallucination — a useful add-on technique, not a full architecture template
+ImageCLEFmedical 2024 (task overview)	ROCOv2	Confirms concept-detection is a well-established separate subtask, evaluated by F1
+Research Gap Identified
+
+No reviewed paper combines (1) predicting CUIs from ROCOv2 images, (2) explicitly fusing predicted-CUI embeddings with visual features via a named mechanism, and (3) decoding a full report — evaluated with BLEU-1–4 and ablated against a no-concept baseline, all in one system on ROCOv2. That combination is the project's defensible contribution.
+
+Critical Review of Original Whiteboard
+"Bio/UMLS → CUI" as a lookup step → unnecessary (CUIs already in ROCOv2).
+"Captions" with an X → correctly rejected as a direct model input (it's the training target only).
+"Hybrid CNN" as a single unlabeled box → too vague to be a research contribution (an ensemble of CNNs was already the 2022 competition-winning approach — not novel). Needs to become two explicitly named branches instead.
+"SwinTransformer −" mark → not rejected outright, just shouldn't be a default choice without justification vs. simpler CNNs.
+Final Recommended Architecture (Section E / Part 4–8)
+ROCOv2 Image
+     │
+     ▼
+Image Preprocessing (resize 224×224, normalize)
+     │
+     ▼
+Visual Encoder — single CNN backbone (ResNet-50, ImageNet-pretrained)
+     │
+     ▼
+Visual Feature Map (7×7×2048 → flattened to 49×2048 "visual tokens")
+     │
+     ├─────────────────────────────┐
+     │                             ▼
+     │                   Concept Prediction Head
+     │                   (GAP → MLP 2048→512→N_concepts, sigmoid, multi-label)
+     │                   Trained on ROCOv2 ground-truth CUIs (top-K frequent, K≈1000–2000)
+     │                             │
+     │                             ▼
+     │                   Predicted CUI embeddings (learned embedding table,
+     │                   top-k predicted CUIs only — NEVER ground truth at inference)
+     ▼                             ▼
+Cross-Attention Fusion (visual features as Query, concept embeddings as Key/Value)
+     │
+     ▼
+Fused Representation (49×512, LayerNorm + residual)
+     │
+     ▼
+Transformer Decoder (2–4 layers for prototype, autoregressive, cross-attends to fused memory)
+     │
+     ▼
+Generated Report → BLEU-1/2/3/4 (+ ROUGE-L as sanity check)
+"Hybrid" — precise definition adopted
+
+NOT a CNN ensemble (already done by others, not novel). Instead: one CNN backbone + one concept-prediction sub-network, fused via cross-attention — this is Candidate B from three options considered (A: ensemble — rejected as unoriginal; B: single CNN + concept branch — recommended; C: multi-scale single-CNN taps — good future ablation, not v1).
+
+UMLS/CUI Pipeline (final algorithm)
+Training: ROCOv2's built-in CUIs → multi-label targets → BCE loss trains the concept head. This is the only place ground truth CUIs are used.
+Inference: image → concept head → top-k predicted CUIs → embedding lookup → fusion. Reference report/CUIs never touched.
+CUI encoding: a learned embedding table (nn.Embedding), not BioBERT — no reviewed paper uses BioBERT to encode CUI codes specifically (BioBERT fits free text, not discrete concept IDs).
+Report Decoder Choice
+
+Transformer decoder recommended over CNN+LSTM/GRU — parallelizable, matches nearly all recent papers reviewed, integrates naturally with cross-attention into the fused memory.
+
+Teacher forcing during training (feed ground-truth previous token).
+Autoregressive generation at inference (feed model's own previous prediction) — watch for exposure bias.
+Padding mask + causal mask needed.
+Vocabulary built from ROCOv2 captions directly, ~2,000–5,000 tokens for the prototype.
+Loss Function (starting values, not final-tuned)
+Total Loss = α × Report Generation Loss (cross-entropy, label smoothing 0.1)
+           + β × Concept Loss (BCE on concept-head logits)
+
+α = 1.0, β = 0.5   (starting point — tune based on Phase 3/4 validation behavior)
+Open Decisions Still Needed From User
+Fusion mechanism final call: cross-attention (more novel, harder to debug) vs. simple concatenation (easier first CPU prototype). Current working assumption is cross-attention, but not locked in.
+ROCOv2 access: confirm whether the dataset is already downloaded/accessible, or whether Phase 1 needs to include the download/setup step.
+CUI vocabulary size (K): needs an actual count from the real ROCOv2 metadata once accessible — currently just an estimate (1000–2000).
+Whether to chase down the 4 unverified [TITLE ONLY] papers via direct PDF upload before finalizing Part 1's literature review table.
+Next Step (Not Yet Started)
+
+Part 9 — CPU smoke-test prototype (train=10/val=2/test=2) has not been started. Per the original rules, this requires the user to be back on a laptop, with ROCOv2 accessible, before Step 1 (environment setup) begins. This summary should be pasted into a new chat to continue directly from "start Part 9 / Step 1" without re-deriving the above.
